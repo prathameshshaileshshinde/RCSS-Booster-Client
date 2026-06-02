@@ -13,7 +13,6 @@ rcsssmj_env/
 
 # Logs
 *.log
-*.TXT
 console.log
 MUJOCO_LOG.TXT
 
