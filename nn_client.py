@@ -33,9 +33,12 @@ HEAD_PITCH_LIMIT_DEG   = (-20.0, 70.0)   # he2 joint limits
 HEAD_SWEEP_DEG_PER_CYCLE = 4.0
 
 # Ball following (body movement) ----------------------------------------------
-ENABLE_BALL_FOLLOWING  = True    # walk toward / orbit / push the ball
+ENABLE_BALL_FOLLOWING  = True    # walk toward the ball
 FOLLOW_FORWARD_SPEED   = 1.0    # forward goal velocity when chasing the ball
-STEER_KP               = 1.0 / (np.pi / 4)  # radians → yaw goal velocity
+# STEER_KP converts degrees of body-relative angle → yaw goal velocity.
+# body_relative_angle = head_yaw_deg + ball_azimuth_deg
+# e.g. 45° off → yaw_vel = 45 * (1/45) = 1.0 (full spin)
+STEER_KP               = 1.0 / 45.0
 
 # Ball persistence ------------------------------------------------------------
 # The vision perceptor fires every 2 cycles (25 Hz). These settings let the
@@ -46,16 +49,6 @@ BALL_SMOOTH_ALPHA      = 0.25   # exponential smoothing weight (0=frozen, 1=raw)
 # Ball-reset detection: if the ball jumps more than this, clear all state.
 BALL_RESET_NEW_DIST_M  = 5.0
 BALL_RESET_OLD_DIST_M  = 3.0
-
-# Movement state machine -------------------------------------------------------
-#   SEEK  : ball is far — walk straight toward it
-#   ORBIT : circle around ball to get behind it relative to the opponent goal
-#   PUSH  : walk through the ball toward goal
-ORBIT_RADIUS_M    = 1.0    # orbit at this distance from the ball
-SEEK_DIST_M       = 3.5    # switch from SEEK to ORBIT below this distance
-PUSH_DIST_M       = 0.8    # switch from ORBIT to PUSH below this distance
-PUSH_ALIGN_DOT    = 0.65   # alignment quality needed to enter PUSH (−1 to +1)
-SEEK_ROTATE_ANGLE = np.pi / 7  # body angle (rad) above which we rotate in place
 
 # Search behaviour (when the ball is completely lost) -------------------------
 ENABLE_SEARCH      = True    # spin the whole body to find the ball
@@ -356,104 +349,39 @@ class Client:
                    else float(self._search_dir)
         return np.array([0.0, 0.0, turn_dir], dtype=np.float32)
 
-    def _decide_goal_vel(self, smooth_bx: float | None, smooth_by: float | None,
-                         goal_x: float | None, goal_y: float | None) -> np.ndarray:
-        """Compute body goal velocity using a three-phase state machine.
+    def _decide_goal_vel(self, ball_raw, cur_head_yaw_deg: float) -> np.ndarray:
+        """Compute body goal velocity to walk toward the ball.
 
-        Phases (checked in order):
-          PUSH  — robot is behind ball and aligned with goal → walk through ball.
-          ORBIT — circle around ball at ORBIT_RADIUS_M to get behind it.
-          SEEK  — ball is far, or no goal info → walk straight toward ball.
+        Strategy (from the original clean client):
+          - The ball azimuth from the camera is the angle the ball is OFF from
+            where the head points. Adding the current head yaw converts that into
+            a body-relative angle.
+          - We walk forward at FOLLOW_FORWARD_SPEED and steer proportionally.
+          - If the ball is not visible and ENABLE_SEARCH is on, spin to search.
 
         Args:
-            smooth_bx: smoothed ball x (forward) in metres, robot frame.
-            smooth_by: smoothed ball y (sideways) in metres, robot frame.
-            goal_x:    goal centre x (forward) in metres, robot frame, or None.
-            goal_y:    goal centre y (sideways) in metres, robot frame, or None.
+            ball_raw:         (dist, az_deg, el_deg) from _parse_ball(), or None.
+            cur_head_yaw_deg: current he1 angle in degrees.
 
         Returns:
-            goal_vel: [forward, sideways, yaw] array for the locomotion policy.
+            goal_vel: [forward, sideways, yaw] for the locomotion policy.
         """
         if not ENABLE_BALL_FOLLOWING:
             return np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-        if smooth_bx is None:
-            # Ball completely unknown — spin to search.
-            if ENABLE_SEARCH and self._cycles_since_ball > LOST_BALL_CYCLES:
-                return self._search_for_ball()
-            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
-
-        steer       = np.arctan2(smooth_by, smooth_bx)          # angle to ball (rad)
-        smooth_dist = float(np.sqrt(smooth_bx**2 + smooth_by**2))
-
-        if goal_x is not None:
-            # ── Goal direction available (live or world-model) ────────────────
-            btg_x   = goal_x - smooth_bx
-            btg_y   = goal_y - smooth_by
-            btg_len = float(np.sqrt(btg_x**2 + btg_y**2)) + 1e-6
-            ux = btg_x / btg_len   # unit vector: ball → goal
-            uy = btg_y / btg_len
-
-            # dot > 0 means robot is behind ball (on the side opposite the goal)
-            dot = (smooth_bx * ux + smooth_by * uy) / (smooth_dist + 1e-6)
-
-            if smooth_dist < PUSH_DIST_M and dot > PUSH_ALIGN_DOT:
-                # ── PUSH ──────────────────────────────────────────────────────
-                # Well behind the ball and aligned: walk straight through it.
-                push_dir = np.arctan2(uy, ux)
-                yaw_vel  = float(np.clip(push_dir / (np.pi / 4), -0.3, 0.3))
-                if self._log_cycle % 25 == 0:
-                    logger.info('[P%d] PUSH  dot=%.2f dist=%.2fm', self._player_no, dot, smooth_dist)
-                return np.array([1.0, 0.0, yaw_vel], dtype=np.float32)
-
-            elif smooth_dist < SEEK_DIST_M:
-                # ── ORBIT ─────────────────────────────────────────────────────
-                # Circle around the ball until directly behind it.
-                ideal_from_ball   = np.arctan2(-uy, -ux)          # opposite of ball→goal
-                current_from_ball = np.arctan2(-smooth_by, -smooth_bx)
-                orbit_err = (ideal_from_ball - current_from_ball + np.pi) % (2 * np.pi) - np.pi
-
-                if abs(orbit_err) < 0.20:
-                    # Close to ideal spot — approach the ball.
-                    yaw_vel = float(np.clip(steer / (np.pi / 4), -0.3, 0.3))
-                    if self._log_cycle % 25 == 0:
-                        logger.info('[P%d] ORBIT→APPROACH err=%.1f° dist=%.2fm',
-                                    self._player_no, np.rad2deg(orbit_err), smooth_dist)
-                    return np.array([1.0, 0.0, yaw_vel], dtype=np.float32)
-                else:
-                    # Advance ~50° along the arc toward the ideal spot.
-                    orbit_step   = float(np.sign(orbit_err)) * (np.pi / 3.6)
-                    new_angle    = current_from_ball + orbit_step
-                    tgt_x = smooth_bx + ORBIT_RADIUS_M * float(np.cos(new_angle))
-                    tgt_y = smooth_by + ORBIT_RADIUS_M * float(np.sin(new_angle))
-                    tgt_dir  = np.arctan2(tgt_y, tgt_x)
-                    tgt_dist = float(np.sqrt(tgt_x**2 + tgt_y**2))
-
-                    if abs(tgt_dir) > np.pi / 6:    # >30°: rotate first
-                        yaw_vel = float(np.clip(tgt_dir / (np.pi / 4), -1.0, 1.0))
-                        x_vel   = 0.4
-                    else:
-                        yaw_vel = float(np.clip(tgt_dir / (np.pi / 4), -0.5, 0.5))
-                        x_vel   = float(np.clip(tgt_dist, 0.3, 1.0))
-                    if self._log_cycle % 25 == 0:
-                        logger.info('[P%d] ORBIT err=%.1f° xv=%.2f yaw=%.2f',
-                                    self._player_no, np.rad2deg(orbit_err), x_vel, yaw_vel)
-                    return np.array([x_vel, 0.0, yaw_vel], dtype=np.float32)
-
-        # ── SEEK ──────────────────────────────────────────────────────────────
-        # Ball is far, or no goal information: walk straight toward the ball.
-        if smooth_dist < 1.5:
-            # Very close but no goal info — inch forward.
-            yaw_vel = float(np.clip(steer / (np.pi / 4), -0.15, 0.15))
-            return np.array([1.0, 0.0, yaw_vel], dtype=np.float32)
-        elif abs(steer) > SEEK_ROTATE_ANGLE:
-            # Ball is to the side — rotate in place first.
-            yaw_vel = float(np.clip(steer * STEER_KP, -1.0, 1.0))
-            return np.array([0.0, 0.0, yaw_vel], dtype=np.float32)
-        else:
-            # Ball roughly ahead — walk and steer.
-            yaw_vel = float(np.clip(steer * STEER_KP, -0.2, 0.2))
+        if ball_raw is not None:
+            _, azimuth, _ = ball_raw
+            # Convert camera-relative azimuth → body-relative angle (degrees).
+            # The head might be turned 20° left and the ball is 10° further left
+            # in the camera → the body needs to turn 30° left total.
+            body_angle = cur_head_yaw_deg + azimuth
+            yaw_vel    = float(np.clip(body_angle * STEER_KP, -1.0, 1.0))
             return np.array([FOLLOW_FORWARD_SPEED, 0.0, yaw_vel], dtype=np.float32)
+
+        # Ball not visible this cycle.
+        if ENABLE_SEARCH and self._cycles_since_ball > LOST_BALL_CYCLES:
+            return np.array([0.0, 0.0, self._search_dir * SEARCH_YAW_SPEED], dtype=np.float32)
+        return np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
     # ═══════════════════════════════════════════════ CSV logging
     def _open_csv(self):
@@ -707,10 +635,7 @@ class Client:
                 if self.wait_until_walking > 0:
                     goal_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
                 else:
-                    goal_vel = self._decide_goal_vel(
-                        self._smooth_ball_x, self._smooth_ball_y,
-                        goal_x, goal_y,
-                    )
+                    goal_vel = self._decide_goal_vel(ball_raw, cur_head_yaw_deg)
 
                 # ── Head tracking ─────────────────────────────────────────────
                 if ENABLE_HEAD_TRACKING:
@@ -763,4 +688,59 @@ class Client:
     def _send_message(self, msg: bytes | bytearray) -> None:
         self._sock.send((len(msg)).to_bytes(4, byteorder='big') + msg)
 
-    def _receive_messa
+    def _receive_message(self) -> bytes | bytearray:
+        if self._sock.recv_into(self._rcv_buffer, nbytes=4, flags=socket.MSG_WAITALL) != 4:
+            raise ConnectionResetError
+        msg_size = int.from_bytes(self._rcv_buffer[:4], byteorder='big', signed=False)
+        if msg_size > self._rcv_buffer_size:
+            self._rcv_buffer_size = msg_size
+            self._rcv_buffer = bytearray(self._rcv_buffer_size)
+        if self._sock.recv_into(self._rcv_buffer, nbytes=msg_size, flags=socket.MSG_WAITALL) != msg_size:
+            raise ConnectionResetError
+        return self._rcv_buffer[:msg_size]
+
+    def parse_sensor_string(self, s: str) -> dict:
+        """Parse the top-level sensor groups (time, pos, quat, GYR, HJ, …) into a dict."""
+        result = {}
+        top_level_pattern = re.compile(r'\((\w+)((?:\s*\([^()]*\))*)\)')
+        for tag, inner in top_level_pattern.findall(s):
+            items = re.findall(r'\(\s*(\w+)((?:\s+[^()]+)+)\)', inner)
+            group = {}
+            for key, vals in items:
+                tokens = vals.strip().split()
+                parsed = []
+                for t in tokens:
+                    try:
+                        parsed.append(float(t))
+                    except ValueError:
+                        parsed.append(t)
+                group[key] = parsed[0] if len(parsed) == 1 else parsed
+            if tag in result:
+                if isinstance(result[tag], list):
+                    result[tag].append(group)
+                else:
+                    result[tag] = [result[tag], group]
+            else:
+                result[tag] = group
+        return result
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='RoboCup MuJoCo Soccer NN Client.')
+    robots = list(Client.ROBOT_MOTORS.keys())
+    parser.add_argument('-s', '--host',      type=str, default='127.0.0.1')
+    parser.add_argument('-p', '--port',      type=int, default=60000)
+    parser.add_argument('-t', '--team',      type=str, default='Test')
+    parser.add_argument('-n', '--player_no', type=int, default=1)
+    parser.add_argument('-r', '--robot',     type=str, default=robots[0], choices=robots)
+    args = parser.parse_args()
+
+    client = Client(args.host, args.port, args.team, args.player_no, args.robot)
+
+    def signal_handler(sig: int, frame: FrameType | int | signal.Handlers | None) -> None:
+        del sig, frame
+        client.shutdown()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    client.run()
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
