@@ -344,26 +344,55 @@ class Client:
         yaw_vel  = float(np.clip(body_ang * STEER_KP, -1.0, 1.0))
         return np.array([FOLLOW_FORWARD_SPEED, 0.0, yaw_vel], dtype=np.float32)
 
-    def _decide_goal_vel(self, ball_raw, cur_head_yaw, role, robot_world_pos, orientation_inv):
+    def _spin_to_search(self):
+        """Spin the body on the spot to scan for the ball.
+
+        Direction matches the head sweep direction (_search_dir) so the
+        head and body rotate together.  Called when the ball has been
+        missing from direct camera vision for more than LOST_BALL_CYCLES
+        cycles AND the world model has no stored position to fall back on.
+        """
+        return np.array([0.0, 0.0, self._search_dir * SEARCH_YAW_SPEED], dtype=np.float32)
+
+    def _decide_goal_vel(self, ball_raw, cur_head_yaw, role, robot_world_pos, orientation_inv,
+                         ball_local_xy=None):
         """Body goal velocity based on role.
 
-        ATTACKER : walk toward the ball (head_yaw + camera_azimuth steering).
-        SUPPORTER: move to support position; fall back to attacker if world
-                   model not yet available.
+        Priority order for the attacker:
+          1. Direct vision  (ball_raw)        — most accurate
+          2. World model / persistence        — ball_local_xy from caller
+          3. Spin to search                   — ball completely lost
+
+        SUPPORTER: move to support position; falls back to attacker logic
+                   if world model not yet available.
         """
         if not ENABLE_BALL_FOLLOWING:
             return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
         if role == 'supporter':
             sv = self._supporter_goal_vel(robot_world_pos, orientation_inv)
             if sv is not None:
                 return sv
+
+        # --- Priority 1: direct camera vision ---
         if ball_raw is not None:
-            _, az, _ = ball_raw
+            _, az, _ = ball_raw           # az already in radians from _parse_ball
             body_ang = cur_head_yaw + az
             yaw_vel  = float(np.clip(body_ang * STEER_KP, -1.0, 1.0))
             return np.array([FOLLOW_FORWARD_SPEED, 0.0, yaw_vel], dtype=np.float32)
+
+        # --- Priority 2: world model / persistence ---
+        if ball_local_xy is not None:
+            bx, by = ball_local_xy
+            az_est   = float(np.arctan2(by, bx))   # radians
+            body_ang = cur_head_yaw + az_est
+            yaw_vel  = float(np.clip(body_ang * STEER_KP, -1.0, 1.0))
+            return np.array([FOLLOW_FORWARD_SPEED, 0.0, yaw_vel], dtype=np.float32)
+
+        # --- Priority 3: ball completely lost — spin to search ---
         if ENABLE_SEARCH and self._cycles_since_ball > LOST_BALL_CYCLES:
-            return np.array([0.0, 0.0, self._search_dir * SEARCH_YAW_SPEED], dtype=np.float32)
+            return self._spin_to_search()
+
         return np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
     # ------------------------------------------------------------------ CSV
@@ -573,11 +602,24 @@ class Client:
                                     pid, tw[0], tw[1], dtb, age)
 
                 # goal velocity
+                # Pass persistence-resolved local position when direct vision is absent.
+                # ball_x/ball_y are already in robot-local frame (from world model or
+                # close-timer layers), so they can steer the body even without a live
+                # camera hit on the ball.
+                ball_local_xy = (
+                    (ball_x, ball_y)
+                    if (ball_raw is None and ball_x is not None)
+                    else None
+                )
+
                 self.wait_until_walking = max(0, self.wait_until_walking - 1)
                 if self.wait_until_walking > 0:
                     goal_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
                 else:
-                    goal_vel = self._decide_goal_vel(ball_raw, cur_head_yaw, self._role, rwp, rot_inv)
+                    goal_vel = self._decide_goal_vel(
+                        ball_raw, cur_head_yaw, self._role, rwp, rot_inv,
+                        ball_local_xy=ball_local_xy,
+                    )
 
                 # head
                 if ENABLE_HEAD_TRACKING:
