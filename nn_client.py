@@ -34,7 +34,15 @@ HEAD_SWEEP_RAD_PER_CYCLE = np.deg2rad(4.0)             # 4° per cycle
 # Ball following
 ENABLE_BALL_FOLLOWING = True
 FOLLOW_FORWARD_SPEED  = 1.0
+STOP_DIST_M           = 1.0                 # orbit radius / stop distance (horizontal)
+SLOW_DIST_M           = 2.0                 # start slowing at this distance (linear ramp)
+ORBIT_SPEED           = 0.3                 # lateral sidestep speed during orbit
+ORBIT_RADIAL_KP       = 0.5                 # gain to hold 1 m from ball
+ALIGN_TOL_RAD         = np.deg2rad(5)       # stop orbiting when ball-goal angle < this
 STEER_KP              = 1.0 / (np.pi / 4)  # radians -> yaw goal velocity (π/4 rad = 45°)
+APPROACH_SPEED        = 0.7                 # gentle push speed when walking ball toward goal
+APPROACH_LATERAL_KP   = 0.4                 # vy gain to keep ball centred during approach
+APPROACH_GOAL_LAT_KP  = 0.0                 # lateral goal-centre correction (disabled: unreliable)
 
 # Ball persistence
 BALL_CLOSE_DIST_M       = 2.0
@@ -119,6 +127,10 @@ class Client:
         self._ball_world_pos    = None
         self._ball_close_timer  = 0
         self._cycles_since_ball = 999
+        self._orbiting          = False  # True once close enough to orbit
+        self._goal_world_dir    = None   # world-frame unit vector toward opponent goal
+        self._goal_dir_init     = False  # True once bootstrapped
+        self._goal_dir_trusted  = False  # True once a both-posts observation was used
         self._goal_world_pos    = None
 
         # multi-robot
@@ -170,6 +182,10 @@ class Client:
         self._ball_world_pos   = None
         self._ball_close_timer = 0
         self._cycles_since_ball = 999
+        self._orbiting          = False
+        self._goal_world_dir    = None
+        self._goal_dir_init     = False
+        self._goal_dir_trusted  = False
         self._head_scan_angle  = 0.0
         self._goal_world_pos   = None
         self._teammate_world_pos = {}
@@ -213,15 +229,39 @@ class Client:
                 float(np.deg2rad(float(m.group(2)))),
                 float(np.deg2rad(float(m.group(3))))) if m else None
 
-    def _parse_goal(self, msg):
-        m1 = re.search(r'\(G1R\s+\(pol\s+(-?[\d.]+)\s+(-?[\d.]+)\s+-?[\d.]+\)\)', msg)
-        m2 = re.search(r'\(G2R\s+\(pol\s+(-?[\d.]+)\s+(-?[\d.]+)\s+-?[\d.]+\)\)', msg)
-        xs, ys = [], []
-        for m in (m1, m2):
-            if m:
-                d, az = float(m.group(1)), np.deg2rad(float(m.group(2)))
-                xs.append(d*np.cos(az)); ys.append(d*np.sin(az))
-        return (float(np.mean(xs)), float(np.mean(ys))) if xs else (None, None)
+    def _parse_goal(self, msg, cur_head_yaw=0.0):
+        """Returns (center_x, center_y, both_posts_visible).
+        Checks all four posts (G1R,G2R for right goal; G1L,G2L for left goal).
+        Prefers whichever side has both posts visible (true midpoint = goal center).
+        Among ties picks the most-forward goal (highest x in head frame).
+        Falls back to single-post if no both-post side exists."""
+        groups = {}
+        for side, names in (('R', ('G1R', 'G2R')), ('L', ('G1L', 'G2L'))):
+            xs, ys = [], []
+            for name in names:
+                m = re.search(
+                    rf'\({name}\s+\(pol\s+(-?[\d.]+)\s+(-?[\d.]+)\s+-?[\d.]+\)', msg)
+                if m:
+                    d, az = float(m.group(1)), np.deg2rad(float(m.group(2)))
+                    xs.append(d*np.cos(az)); ys.append(d*np.sin(az))
+            if xs:
+                groups[side] = (float(np.mean(xs)), float(np.mean(ys)), len(xs) == 2)
+        if not groups:
+            return (None, None, False)
+        # Log when we first get a true-center reading
+        if any(v[2] for v in groups.values()):
+            logger.info('[goal] BOTH POSTS visible: %s', groups)
+        # Prefer sides with both posts (true center); else fall back to single-post
+        full = {s: v for s, v in groups.items() if v[2]}
+        use  = full if full else groups
+        # Pick most-forward goal using BODY-frame x (not head frame) so head
+        # panning toward the ball doesn't select the wrong goal.
+        cos_h, sin_h = float(np.cos(cur_head_yaw)), float(np.sin(cur_head_yaw))
+        def _body_x(side):
+            hx, hy, _ = use[side]
+            return hx * cos_h - hy * sin_h
+        best = max(use, key=_body_x)
+        return use[best]
 
     def _parse_players(self, msg):
         """Parse (P ...) S-expression blocks -> list of player dicts.
@@ -355,7 +395,7 @@ class Client:
         return np.array([0.0, 0.0, self._search_dir * SEARCH_YAW_SPEED], dtype=np.float32)
 
     def _decide_goal_vel(self, ball_raw, cur_head_yaw, role, robot_world_pos, orientation_inv,
-                         ball_local_xy=None):
+                         ball_local_xy=None, goal_local_xy=None, goal_center_fresh=False):
         """Body goal velocity based on role.
 
         Priority order for the attacker:
@@ -376,18 +416,81 @@ class Client:
 
         # --- Priority 1: direct camera vision ---
         if ball_raw is not None:
-            _, az, _ = ball_raw           # az already in radians from _parse_ball
-            body_ang = cur_head_yaw + az
-            yaw_vel  = float(np.clip(body_ang * STEER_KP, -1.0, 1.0))
-            return np.array([FOLLOW_FORWARD_SPEED, 0.0, yaw_vel], dtype=np.float32)
+            dist, az, el = ball_raw
+            bx, by, _    = self._polar_to_cartesian(dist, az, el)
+            horiz_d      = float(np.sqrt(bx*bx + by*by))
+            ball_body_az = cur_head_yaw + az
+            # Enter orbit once within orbit radius; exit only if ball resets far away
+            if horiz_d < STOP_DIST_M + 0.5:
+                self._orbiting = True
+            if horiz_d > SLOW_DIST_M:
+                self._orbiting = False
+            if self._orbiting:
+                orb_yaw  = float(np.clip(ball_body_az * STEER_KP, -1.0, 1.0))
+                vx_r     = float(np.clip(
+                    (horiz_d - STOP_DIST_M) * ORBIT_RADIAL_KP, -0.3, 0.3))
+                if goal_local_xy is not None:
+                    _gx, _gy      = goal_local_xy
+                    _goal_body_az = float(self._wrap_to_pi(
+                        float(np.arctan2(_gy, _gx)) + cur_head_yaw))
+                    _signed_err   = float(self._wrap_to_pi(
+                        ball_body_az - _goal_body_az))
+                    _stop_tol = np.deg2rad(2) if goal_center_fresh else ALIGN_TOL_RAD
+                    logger.debug('[orbit] err=%.1f° tol=%.1f° fresh=%s',
+                                 np.degrees(_signed_err), np.degrees(_stop_tol), goal_center_fresh)
+                    if abs(_signed_err) < _stop_tol:
+                        self._orbiting = False
+                        logger.info('[orbit] ALIGNED err=%.1f° -> approach', np.degrees(_signed_err))
+                        _app_yaw = float(np.clip(_goal_body_az * STEER_KP, -1.0, 1.0))
+                        _app_vy  = float(np.clip(
+                            ball_body_az * APPROACH_LATERAL_KP, -0.3, 0.3))
+                        return np.array([APPROACH_SPEED, _app_vy, _app_yaw], dtype=np.float32)
+                    # Pick shorter arc: positive err → CW (vy<0), negative → CCW (vy>0)
+                    orbit_vy = float(np.sign(_signed_err) * ORBIT_SPEED)
+                else:
+                    orbit_vy = ORBIT_SPEED
+                return np.array([vx_r, orbit_vy, orb_yaw], dtype=np.float32)
+            ramp    = float(np.clip(
+                (horiz_d - STOP_DIST_M) / (SLOW_DIST_M - STOP_DIST_M), 0.0, 1.0))
+            yaw_vel = float(np.clip(ball_body_az * STEER_KP, -1.0, 1.0))
+            return np.array([FOLLOW_FORWARD_SPEED * ramp, 0.0, yaw_vel], dtype=np.float32)
 
         # --- Priority 2: world model / persistence ---
         if ball_local_xy is not None:
-            bx, by = ball_local_xy
-            az_est   = float(np.arctan2(by, bx))   # radians
-            body_ang = cur_head_yaw + az_est
-            yaw_vel  = float(np.clip(body_ang * STEER_KP, -1.0, 1.0))
-            return np.array([FOLLOW_FORWARD_SPEED, 0.0, yaw_vel], dtype=np.float32)
+            bx, by   = ball_local_xy
+            horiz_d  = float(np.sqrt(bx*bx + by*by))
+            az_est   = float(np.arctan2(by, bx))
+            ball_body_az = cur_head_yaw + az_est
+            if horiz_d < STOP_DIST_M + 0.5:
+                self._orbiting = True
+            if horiz_d > SLOW_DIST_M:
+                self._orbiting = False
+            if self._orbiting:
+                orb_yaw  = float(np.clip(ball_body_az * STEER_KP, -1.0, 1.0))
+                vx_r     = float(np.clip(
+                    (horiz_d - STOP_DIST_M) * ORBIT_RADIAL_KP, -0.3, 0.3))
+                if goal_local_xy is not None:
+                    _gx, _gy      = goal_local_xy
+                    _goal_body_az = float(self._wrap_to_pi(
+                        float(np.arctan2(_gy, _gx)) + cur_head_yaw))
+                    _signed_err   = float(self._wrap_to_pi(
+                        ball_body_az - _goal_body_az))
+                    _stop_tol = np.deg2rad(2) if goal_center_fresh else ALIGN_TOL_RAD
+                    if abs(_signed_err) < _stop_tol:
+                        self._orbiting = False
+                        logger.info('[orbit2] ALIGNED err=%.1f° -> approach', np.degrees(_signed_err))
+                        _app_yaw = float(np.clip(_goal_body_az * STEER_KP, -1.0, 1.0))
+                        _app_vy  = float(np.clip(
+                            ball_body_az * APPROACH_LATERAL_KP, -0.3, 0.3))
+                        return np.array([APPROACH_SPEED, _app_vy, _app_yaw], dtype=np.float32)
+                    orbit_vy = float(np.sign(_signed_err) * ORBIT_SPEED)
+                else:
+                    orbit_vy = ORBIT_SPEED
+                return np.array([vx_r, orbit_vy, orb_yaw], dtype=np.float32)
+            ramp     = float(np.clip(
+                (horiz_d - STOP_DIST_M) / (SLOW_DIST_M - STOP_DIST_M), 0.0, 1.0))
+            yaw_vel  = float(np.clip(ball_body_az * STEER_KP, -1.0, 1.0))
+            return np.array([FOLLOW_FORWARD_SPEED * ramp, 0.0, yaw_vel], dtype=np.float32)
 
         # --- Priority 3: ball completely lost — spin to search ---
         if ENABLE_SEARCH and self._cycles_since_ball > LOST_BALL_CYCLES:
@@ -527,13 +630,37 @@ class Client:
                     self._cycles_since_ball += 1
 
                 # goal
-                goal_x, goal_y = self._parse_goal(msg)
+                goal_x, goal_y, _goal_center = self._parse_goal(msg, cur_head_yaw)
                 if goal_x is not None and rwp is not None:
                     self._goal_world_pos = rwp + rot.apply(
                         np.array([goal_x, goal_y, 0.0], dtype=np.float32))
                 if goal_x is None and self._goal_world_pos is not None and rwp is not None:
                     gl = rot_inv.apply(self._goal_world_pos - rwp)
                     goal_x, goal_y = float(gl[0]), float(gl[1])
+
+                # Goal direction persistence (IMU-based).
+                # Only update from both-posts (true center). Single-post sightings
+                # are skipped so the estimate is never pulled toward a corner post.
+                if goal_x is not None and _goal_center:
+                    _g_az_h = float(np.arctan2(goal_y, goal_x))
+                    _g_az_b = _g_az_h + cur_head_yaw
+                    _g_d    = float(np.sqrt(goal_x**2 + goal_y**2))
+                    _g_b    = np.array([_g_d*np.cos(_g_az_b), _g_d*np.sin(_g_az_b), 0.0],
+                                       dtype=np.float32)
+                    self._goal_world_dir = rot.apply(_g_b / np.linalg.norm(_g_b))
+                    self._goal_dir_trusted = True
+
+                # goal_for_align: always use true-center direction.
+                # Fresh center observation beats IMU-persisted; single-post
+                # observations are ignored in favour of the stored direction.
+                if goal_x is not None and _goal_center:
+                    goal_for_align = (goal_x, goal_y)
+                elif self._goal_world_dir is not None:
+                    _gbd = rot_inv.apply(self._goal_world_dir)
+                    _gah = float(np.arctan2(_gbd[1], _gbd[0])) - cur_head_yaw
+                    goal_for_align = (float(100.0*np.cos(_gah)), float(100.0*np.sin(_gah)))
+                else:
+                    goal_for_align = None
 
                 # ball persistence layer 0: fresh vision
                 if ball_x is not None:
@@ -613,12 +740,19 @@ class Client:
                 )
 
                 self.wait_until_walking = max(0, self.wait_until_walking - 1)
+                if self.wait_until_walking == 0 and not self._goal_dir_init:
+                    self._goal_world_dir = rot.apply(
+                        np.array([1.0, 0.0, 0.0], dtype=np.float32))
+                    self._goal_dir_init = True
+                    logger.info('[P%d] Goal direction bootstrapped', self._player_no)
                 if self.wait_until_walking > 0:
                     goal_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
                 else:
                     goal_vel = self._decide_goal_vel(
                         ball_raw, cur_head_yaw, self._role, rwp, rot_inv,
                         ball_local_xy=ball_local_xy,
+                        goal_local_xy=goal_for_align,
+                        goal_center_fresh=_goal_center,
                     )
 
                 # head
