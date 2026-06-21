@@ -43,14 +43,6 @@ ORBIT_RADIAL_KP       = 0.5                 # gain to hold 1 m from ball
 ALIGN_TOL_RAD         = np.deg2rad(5)       # stop orbiting when ball-goal angle < this
 ALIGN_THRESHOLD_RAD   = np.deg2rad(8)      # stop condition for spawn-yaw fallback (8°)
 STEER_KP              = 1.0 / (np.pi / 4)  # radians -> yaw goal velocity (π/4 rad = 45°)
-APPROACH_SPEED        = 0.7                 # gentle push speed when walking ball toward goal
-APPROACH_LATERAL_KP   = 0.4                 # vy gain to keep ball centred during approach
-APPROACH_GOAL_LAT_KP  = 0.0                 # lateral goal-centre correction (disabled)
-
-# Play mode
-KICKOFF_STAND_CYCLES   = 150  # cycles to hold formation after kickoff (~3 s at 50 Hz)
-FORMATION_ARRIVE_DIST  = 0.5  # metres — stop walking to formation when this close to target
-DR_WALK_SPEED_MPS      = 0.83  # calibrated to real walk speed
 
 # Ball persistence
 BALL_CLOSE_DIST_M       = 2.0
@@ -175,12 +167,10 @@ class Client:
         self._post_kickoff_wait   = 0      # countdown cycles after kickoff before chasing ball
 
         # misc
-        self._cycle             = 0
-        self._log_cycle         = 0
-        self._csv_writer        = None
-        self._csv_file          = None
-        self._csv_header_done   = False
-        self._aligned_with_goal = False  # True once robot-ball-goal are collinear; stays True
+        self._cycle      = 0
+        self._log_cycle  = 0
+        self._csv_writer = None
+        self._csv_file   = None
 
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
@@ -226,15 +216,6 @@ class Client:
         self._dr_pos             = None
         self._dr_walk_dir        = None
         self._role               = self._default_role
-        self._aligned_with_goal  = False
-        self._orbiting           = False
-        self._spawn_yaw          = None
-        self._play_mode          = None   # None until first server message received
-        self._prev_play_mode     = None
-        self._formation_phase     = True
-        self._at_formation_cycles = 0
-        self._formation_arrived   = False
-        self._post_kickoff_wait   = 0
 
     @staticmethod
     def _wrap_to_pi(x):
@@ -556,8 +537,8 @@ class Client:
                 perception_msg = self._receive_message()
 
                 if not self._has_beamed:
-                    # Beam to the sideline — establishes torso_pos so we can navigate precisely.
-                    # Robot then walks from sideline to its BEAM_POSES formation position.
+                    bp = self.BEAM_POSES[self._player_no]
+                    self._send_message(f'(beam {bp[0]} {bp[1]} {bp[2]})'.encode())
                     self._has_beamed = True
                     self._init_policy_runtime_state()
                     sx, sy, sa = self.SIDELINE_POSES[self._player_no]
@@ -593,13 +574,10 @@ class Client:
                 scaled_and_clipped_ang_vel = np.clip(ang_vel / 50.0, -1.0, 1.0).astype(np.float32)
 
                 # orientation
-                orientation_quat_mj_convention = np.array(perception_data['quat']['q'], dtype=np.float32)
-                rot     = R.from_quat([orientation_quat_mj_convention[1],
-                                       orientation_quat_mj_convention[2],
-                                       orientation_quat_mj_convention[3],
-                                       orientation_quat_mj_convention[0]])
-                orientation_quat_inv = rot.inv()
-                projected_gravity    = orientation_quat_inv.apply(np.array([0.0, 0.0, -1.0])).astype(np.float32)
+                q = np.array(perception_data['quat']['q'], dtype=np.float32)
+                rot     = R.from_quat([q[1], q[2], q[3], q[0]])
+                rot_inv = rot.inv()
+                grav    = rot_inv.apply(np.array([0.0, 0.0, -1.0])).astype(np.float32)
 
                 # Record body yaw on first cycle after beam — used as goal-direction proxy
                 if self._spawn_yaw is None:
@@ -609,23 +587,13 @@ class Client:
 
                 # robot world pos — update if server sends it; otherwise keep last known
                 tm = re.search(
-                    r'\(pos\s+\(n\s+torso_pos\)\s+\(pos\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\)\)', perception_msg_str)
-                if tm:
-                    rwp = np.array([float(tm.group(1)), float(tm.group(2)), float(tm.group(3))], dtype=np.float32)
-                    self._robot_world_pos = rwp
-                else:
-                    rwp = self._robot_world_pos  # use last known position
-
-                # Dead-reckoning fallback: when server doesn't provide torso_pos, use DR estimate
-                if rwp is None and self._dr_pos is not None:
-                    rwp = np.array(
-                        [self._dr_pos[0], self._dr_pos[1], 0.0], dtype=np.float32)
+                    r'\(pos\s+\(n\s+torso_pos\)\s+\(pos\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\)\)', msg)
+                rwp = (np.array([float(tm.group(1)), float(tm.group(2)), float(tm.group(3))], dtype=np.float32)
+                       if tm else None)
+                self._robot_world_pos = rwp
 
                 # game state
-                gsm = re.search(
-                    r'\(GS\s+\(t\s+([\d.]+)\)\s+\(pm\s+(\w+)\)'
-                    r'(?:\s+\(tl\s+(\S+)\))?(?:\s+\(tr\s+(\S+)\))?',
-                    perception_msg_str)
+                gsm = re.search(r'\(GS\s+\(t\s+([\d.]+)\)\s+\(pm\s+(\w+)\)', msg)
                 game_time = float(gsm.group(1)) if gsm else 0.0
                 play_mode = gsm.group(2)         if gsm else 'Unknown'
                 if gsm and self._team_side is None:
@@ -797,194 +765,10 @@ class Client:
                     logger.info('[P%d] PERCEPTION SAMPLE (full): %s', self._player_no, perception_msg_str[:1500])
 
                 self.wait_until_walking = max(0, self.wait_until_walking - 1)
-
-                # Update dead-reckoning position during formation walk
-                if (self._formation_phase and self.wait_until_walking == 0
-                        and self._dr_pos is not None and self._dr_walk_dir is not None):
-                    _btx2, _bty2, _ = self.BEAM_POSES[self._player_no]
-                    _dr_to_target = float(np.linalg.norm(
-                        self._dr_pos - np.array([_btx2, _bty2], dtype=np.float32)))
-                    if _dr_to_target > 0.0:
-                        _step = DR_WALK_SPEED_MPS * self._policy_dt
-                        if _step >= _dr_to_target:
-                            # Would reach/overshoot — snap exactly to target
-                            self._dr_pos = np.array([_btx2, _bty2], dtype=np.float32)
-                        else:
-                            self._dr_pos = (
-                                self._dr_pos
-                                + self._dr_walk_dir * _step)
-                    if self._log_cycle % 25 == 0:
-                        logger.info('[P%d] DR pos=(%.1f,%.1f) dist_to_target=%.1f',
-                                    self._player_no,
-                                    float(self._dr_pos[0]), float(self._dr_pos[1]),
-                                    _dr_to_target)
-
-                # diagnostic: log state every 25 cycles during formation
-                if self._formation_phase and self._log_cycle % 25 == 0:
-                    logger.info('[P%d] formation_phase  pm=%s  rwp=%s  wait=%d',
-                                self._player_no, play_mode,
-                                f'({rwp[0]:.1f},{rwp[1]:.1f})' if rwp is not None else 'None',
-                                self.wait_until_walking)
-
-                if self._formation_phase:
-                    if self.wait_until_walking > 0:
-                        goal_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-                    elif rwp is not None:
-                        pass  # handled below
-                    else:
-                        goal_vel = np.array([FOLLOW_FORWARD_SPEED, 0.0, 0.0], dtype=np.float32)
-                    if self.wait_until_walking == 0 and rwp is not None:
-                        _tx, _ty, _ = self.BEAM_POSES[self._player_no]
-                        _dist_form = float(np.linalg.norm(
-                            rwp[:2] - np.array([_tx, _ty], dtype=np.float32)))
-                        if _dist_form < FORMATION_ARRIVE_DIST:
-                            # Signal arrival the first time we're within range
-                            if not self._formation_arrived:
-                                self._formation_arrived = True
-                                self._post_kickoff_wait = KICKOFF_STAND_CYCLES  # 3 s hold
-                                logger.info('[P%d] Formation position reached — holding for %d cycles',
-                                            self._player_no, KICKOFF_STAND_CYCLES)
-                                if self._ready_file:
-                                    try:
-                                        with open(self._ready_file, 'a') as _rf:
-                                            _rf.write(f'{self._player_no}\n')
-                                    except OSError as _e:
-                                        logger.warning('[P%d] Could not write ready file: %s',
-                                                       self._player_no, _e)
-                            # Count down — then release to chase ball
-                            _yaw_to_ball = float(np.clip(cur_head_yaw * STEER_KP, -1.0, 1.0))
-                            goal_vel = np.array([0.0, 0.0, _yaw_to_ball], dtype=np.float32)
-                            if self._post_kickoff_wait > 0:
-                                self._post_kickoff_wait -= 1
-                                if self._post_kickoff_wait == 0:
-                                    self._formation_phase = False
-                                    logger.info('[P%d] Hold done — chasing ball!', self._player_no)
-                        else:
-                            self._at_formation_cycles = 0
-                            goal_vel = self._walk_to_formation(rwp, orientation_quat_inv)
-
-                elif self._post_kickoff_wait > 0:
-                    # Just kicked off — stand still and face the ball for 3 seconds
-                    self._post_kickoff_wait -= 1
-                    _yaw_to_ball = float(np.clip(cur_head_yaw * STEER_KP, -1.0, 1.0))
-                    goal_vel = np.array([0.0, 0.0, _yaw_to_ball], dtype=np.float32)
-                    if self._post_kickoff_wait == 0:
-                        logger.info('[P%d] Post-kickoff hold done — chasing ball!', self._player_no)
-
-                elif self._aligned_with_goal:
-                    # Aligned: walk forward to push ball into goal.
-                    # Keep body pointed at goal using spawn-yaw-based correction.
-                    _push_yaw_vel = 0.0
-                    if self._spawn_yaw is not None:
-                        _sfwd_p = rot.apply(np.array([1.0, 0.0, 0.0], dtype=np.float32))
-                        _push_curr_yaw = float(np.arctan2(float(_sfwd_p[1]), float(_sfwd_p[0])))
-                        _push_target   = float(self._wrap_to_pi(self._spawn_yaw + np.pi / 2))
-                        _push_err      = float(self._wrap_to_pi(_push_curr_yaw - _push_target))
-                        _push_yaw_vel  = float(np.clip(-_push_err * STEER_KP, -1.0, 1.0))
-                    goal_vel = np.array([APPROACH_SPEED, 0.0, _push_yaw_vel], dtype=np.float32)
-
-                    # Re-orbit if the ball is no longer in front (robot missed the ball).
-                    _err = None
-                    if _ball_body_az is not None:
-                        _err = float(self._wrap_to_pi(_ball_body_az))
-                    elif self._spawn_yaw is not None:
-                        # Use body-yaw drift as proxy when ball not directly visible.
-                        _err = float(self._wrap_to_pi(_push_curr_yaw - _push_target))
-                    if _err is not None and abs(_err) > 3 * ALIGN_THRESHOLD_RAD:
-                        self._aligned_with_goal = False
-                        self._orbiting = False
-                        logger.info('[P%d] Re-orbiting (drift %.1f°)', self._player_no, np.rad2deg(abs(_err)))
-
+                if self.wait_until_walking > 0:
+                    goal_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
                 else:
-                    # Supporter: use standard decision.
-                    if self._role != 'attacker':
-                        goal_vel = self._decide_goal_vel(ball_raw, cur_head_yaw, self._role, rwp, orientation_quat_inv)
-                    else:
-                        # ATTACKER: use ball_dist (works from last_known/world-model, not just fresh vision)
-                        # so orbit never stalls on blind frames.
-                        if ball_dist is not None:
-                            if ball_dist <= ORBIT_ENGAGE_M + 0.3:
-                                self._orbiting = True
-                            if ball_dist > SLOW_DIST_M:
-                                self._orbiting = False
-
-                        if not self._orbiting:
-                            # APPROACH: walk toward ball + lateral pre-position.
-                            goal_vel = self._decide_goal_vel(ball_raw, cur_head_yaw, self._role, rwp, orientation_quat_inv)
-                            if _ball_body_az is not None and _goal_body_az is not None:
-                                goal_vel[1] = float(np.clip(
-                                    float(self._wrap_to_pi(_ball_body_az - _goal_body_az)) * APPROACH_LATERAL_KP,
-                                    -0.3, 0.3))
-                        else:
-                            # ORBIT: circle ball, maintaining radius, shortest arc toward goal.
-                            # Use cur_head_yaw as ball-direction estimate (head tracks ball).
-                            _yaw_to_ball = float(np.clip(
-                                (cur_head_yaw + (ball_raw[1] if ball_raw is not None else 0.0)) * STEER_KP,
-                                -1.0, 1.0))
-                            _vx_orbit = float(np.clip(
-                                ((ball_dist or ORBIT_RADIUS_M) - ORBIT_RADIUS_M) * ORBIT_RADIAL_KP,
-                                -FOLLOW_FORWARD_SPEED, FOLLOW_FORWARD_SPEED))
-                            # Compute goal-target yaw from spawn yaw (always available).
-                            # spawn_yaw = direction robot faces at beam (-90° = south).
-                            # Opponent goal is 90° CCW from that (east = 0°).
-                            _sfwd2 = rot.apply(np.array([1.0, 0.0, 0.0], dtype=np.float32))
-                            _curr_yaw = float(np.arctan2(float(_sfwd2[1]), float(_sfwd2[0])))
-                            _goal_target_yaw = (float(self._wrap_to_pi(self._spawn_yaw + np.pi / 2))
-                                                if self._spawn_yaw is not None else 0.0)
-
-                            # Only trust goal detection when it's approximately in the expected direction.
-                            # This prevents the own goal (behind the robot during orbit) from being
-                            # mistaken for the opponent goal and triggering a premature alignment.
-                            # Expected goal body-frame azimuth = wrap(target_world_yaw - curr_body_yaw).
-                            _expected_goal_body = float(self._wrap_to_pi(_goal_target_yaw - _curr_yaw))
-                            _goal_in_right_dir = (_goal_body_az is not None and
-                                                  abs(float(self._wrap_to_pi(_goal_body_az - _expected_goal_body)))
-                                                  < np.deg2rad(45))
-
-                            # Direction: use goal body-az when visible AND in expected direction;
-                            # otherwise fall back to shortest arc toward spawn-based target yaw.
-                            if _goal_in_right_dir:
-                                _baz = _ball_body_az if _ball_body_az is not None else cur_head_yaw
-                                _vy = float(np.sign(float(self._wrap_to_pi(_baz - _goal_body_az)))) * ORBIT_SPEED
-                                if _vy == 0.0:
-                                    _vy = -ORBIT_SPEED
-                            else:
-                                # Shortest arc to alignment target using body yaw.
-                                _arc = float(self._wrap_to_pi(_curr_yaw - _goal_target_yaw))
-                                # _arc < 0 → robot is CW from target → need CCW orbit → _vy < 0
-                                # _arc > 0 → robot is CCW from target → need CW orbit → _vy > 0
-                                _vy = float(np.sign(_arc)) * ORBIT_SPEED if _arc != 0.0 else -ORBIT_SPEED
-                            goal_vel = np.array([_vx_orbit, _vy, _yaw_to_ball], dtype=np.float32)
-
-                            # Alignment check.
-                            # FALLBACK A: world model (requires torso_pos — rarely available)
-                            # FALLBACK B: both ball and goal visible in head frame
-                            # FALLBACK C: body yaw vs spawn-derived target (always available)
-                            _aligned = False
-                            if (self._ball_world_pos is not None and self._goal_world_pos is not None
-                                    and rwp is not None):
-                                _bl = orientation_quat_inv.apply(self._ball_world_pos - rwp)
-                                _gl = orientation_quat_inv.apply(self._goal_world_pos - rwp)
-                                _aligned = (abs(float(self._wrap_to_pi(
-                                    float(np.arctan2(_bl[1], _bl[0])) - float(np.arctan2(_gl[1], _gl[0])))))
-                                            < ALIGN_THRESHOLD_RAD)
-                            elif _ball_body_az is not None and _goal_in_right_dir:
-                                # _goal_in_right_dir already confirms _goal_body_az is not None
-                                # AND the goal is in the expected direction (not own goal).
-                                _aligned = (abs(float(self._wrap_to_pi(_ball_body_az - _goal_body_az)))
-                                            < ALIGN_THRESHOLD_RAD)
-                            elif self._spawn_yaw is not None:
-                                _yaw_err  = abs(float(self._wrap_to_pi(_curr_yaw - _goal_target_yaw)))
-                                _ball_ahead = abs(cur_head_yaw) < np.deg2rad(15)
-                                _aligned = (_yaw_err < ALIGN_THRESHOLD_RAD and _ball_ahead)
-                                logger.info('[P%d] align-C  curr=%.1f°  target=%.1f°  err=%.1f°  head=%.1f°  vy=%.2f  ok=%s',
-                                            self._player_no, np.rad2deg(_curr_yaw), np.rad2deg(_goal_target_yaw),
-                                            np.rad2deg(_yaw_err), np.rad2deg(cur_head_yaw), _vy, _aligned)
-                            if _aligned:
-                                self._aligned_with_goal = True
-                                self._orbiting = False
-                                logger.info('[P%d] Aligned with goal — stopping', self._player_no)
-                                goal_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                    goal_vel = self._decide_goal_vel(ball_raw, cur_head_yaw, self._role, rwp, rot_inv)
 
                 # head
                 if ENABLE_HEAD_TRACKING:
@@ -1072,27 +856,22 @@ class Client:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='The RoboCup MuJoCo Soccer Simulation Booster Client.')
     robots = list(Client.ROBOT_MOTORS.keys())
-    parser.add_argument('-s', '--host',      type=str, help='The server address.', default='127.0.0.1', required=False)
-    parser.add_argument('-p', '--port',      type=int, help='The server port.',    default=60000,       required=False)
-    parser.add_argument('-t', '--team',      type=str, help='The team name.',      default='Test',      required=False)
-    parser.add_argument('-n', '--player_no', type=int, help='The player number.',  default=1,           required=False)
-    parser.add_argument('-r', '--robot',      type=str, help='The robot model.',    default=robots[0],   required=False, choices=robots)
-    parser.add_argument('--ready-file',       type=str, help='Path to formation-ready status file shared with trainer.py.',
-                        default='formation_ready.txt', required=False)
-
+    parser.add_argument('-s', '--host',      type=str, default='127.0.0.1')
+    parser.add_argument('-p', '--port',      type=int, default=60000)
+    parser.add_argument('-t', '--team',      type=str, default='Test')
+    parser.add_argument('-n', '--player_no', type=int, default=1)
+    parser.add_argument('-r', '--robot',     type=str, default=robots[0], choices=robots)
+    parser.add_argument('--default-role',    type=str, default='attacker',
+                        choices=['attacker', 'supporter'],
+                        help='Starting role when no teammate is visible (default: attacker)')
     args = parser.parse_args()
 
-    def _shutdown(sig: int, frame: FrameType | None) -> None:
+    client = Client(args.host, args.port, args.team, args.player_no, args.robot,
+                    default_role=args.default_role)
+
+    def signal_handler(sig, frame):
+        del sig, frame
         client.shutdown()
 
-    client = Client(
-        host=args.host,
-        port=args.port,
-        team=args.team,
-        player_no=args.player_no,
-        model_name=args.robot,
-        ready_file=args.ready_file,
-    )
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, signal_handler)
     client.run()
