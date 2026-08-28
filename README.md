@@ -146,3 +146,53 @@ Or run this PowerShell command (replace the path if needed):
 | `--count` | `0` | Wait for this many robots before kickoff (0 = use `--delay`) |
 | `--delay` | `3.0` | Seconds to wait before kickoff (used when `--count` is 0) |
 | `--side` | `Left` | Which team kicks off |
+
+---
+
+## Thesis Experiment Client
+
+The repository contains **two separate clients** that coexist without interference:
+
+| File | Purpose |
+|------|---------|
+| `nn_client.py` | Original internship client — **never modified**. Runs with the same command as before. |
+| `thesis_nn_client.py` | Thesis experiment client with corrected perception parsing and extended CSV logging. |
+
+### Why two clients?
+
+`nn_client.py` uses a flat regex S-expression parser that breaks on nested sub-expressions produced by **RCSSServerMJ 0.2.0**. Specifically:
+
+- The GS regex does not match the 0.2.0 message format, so `game_time` is always `0.0` and `play_mode` is always `'Unknown'`.
+- The torso-position regex expects `(pos x y z)` but the server sends `(p x y z)`, so `robot_world_x/y/z` are always empty.
+
+Rather than modify the internship client (which would change the commit history and risk breaking the original experiments), `thesis_nn_client.py` was created as a standalone file. It fixes both issues with a stack-based S-expression parser and dedicated field extractors, and adds thesis-specific CSV columns.
+
+### What `thesis_nn_client.py` adds
+
+- `ThesisClient._parse_sexp_tree(s)` — stack-based parser; handles arbitrary nesting.
+- `ThesisClient._extract_gs(tree)` — reads `t`, `pm`, `tl`, `tr`, `sl`, `sr` from the GS node.
+- `ThesisClient._extract_torso_pos(tree)` — reads `(p x y z)` from the `pos/torso_pos` node.
+- `ThesisClient._parse_players_from_tree(tree)` — player extraction via the corrected tree.
+- Extra CSV columns: `wall_elapsed_time`, `score_left`, `score_right`, `data_valid`.
+- Events: `agent_started`, `pm_<mode>` (on every play-mode transition), `agent_stopped`.
+- `--debug-perception` flag: writes the first complete perception message to `perception_debug_<team>_p<n>.txt`.
+
+### Running the thesis client
+
+```bash
+# Player 1, team BlueTeam
+python thesis_nn_client.py -t BlueTeam -n 1
+
+# With perception debugging enabled
+python thesis_nn_client.py -t BlueTeam -n 1 --debug-perception
+```
+
+CSV output goes to `CSV/thesis_robot_log_<team>_p<n>_<timestamp>.csv`.
+
+### Unit tests
+
+```bash
+python -m unittest test_thesis_parser -v
+```
+
+Runs 24 tests covering the sexp parser, GS extractor, torso extractor, player extractor, team-side detection, and edge cases. No GPU or server required.
