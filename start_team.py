@@ -39,9 +39,6 @@ def main():
                         help='Number of robots to spawn, players 1..N (default: 11)')
     parser.add_argument('--delay', type=float, default=0.2,
                         help='Delay in seconds between spawning each agent (default: 0.2)')
-    parser.add_argument('--ready-file', type=str, default='formation_ready.txt',
-                        help='Shared file agents write to when they reach formation '
-                             '(default: formation_ready.txt). Pass the same value to trainer.py.')
     args = parser.parse_args()
 
     count = max(1, min(args.count, 11))   # clamp to 1-11
@@ -55,14 +52,12 @@ def main():
         '--port',       str(args.port),
         '--team',       args.team,
         '--robot',      args.robot,
-        '--ready-file', args.ready_file,
     ]
 
     processes: list[subprocess.Popen] = []
 
     print(f'[INFO] Starting team "{args.team}" — {count} x {args.robot} robots')
     print(f'[INFO] Server: {args.host}:{args.port}')
-    print(f'[INFO] Formation ready file: {args.ready_file}')
     print('[INFO] Press Ctrl+C to stop all agents.\n')
 
     for player_no in range(1, count + 1):

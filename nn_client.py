@@ -9,12 +9,12 @@ import threading
 from collections.abc import Mapping
 from types import FrameType
 from typing import ClassVar
-
+import random
 import numpy as np
 import re
 from scipy.spatial.transform import Rotation as R
 import torch
-
+import time
 from torch_policy import load_policy_from_files
 
 # ============================================================================
@@ -86,27 +86,11 @@ logger = logging.getLogger(__name__)
 
 
 class Client:
-    BEAM_POSES: ClassVar[Mapping[int, tuple[float, float, float]]] = {
-        1:  (27.5,  0.0, 0), 2:  (22.0, 12.0, 0), 3:  (22.0,  4.0, 0),
-        4:  (22.0, -4.0, 0), 5:  (22.0,-12.0, 0), 6:  (15.0,  0.0, 0),
-        7:  ( 4.0, 16.0, 0), 8:  (11.0,  6.0, 0), 9:  (11.0, -6.0, 0),
-        10: ( 4.0,-16.0, 0), 11: ( 7.0,  0.0, 0),
+    BEAM_POSES = {
+        1:  (2.0,  0.0, 0)
     }
 
-    # Sideline spawn positions — each robot beams to the sideline directly above/below
-    # its BEAM_POSES target, facing inward (-90 = face toward -y, +90 = face toward +y).
-    # This means the robot only needs to walk straight forward to reach its position.
-    SIDELINE_POSES: ClassVar[Mapping[int, tuple[float, float, float]]] = {
-        # Players 2&3 share target x=22 (top sideline) — stagger by 2 m so they don't clash at spawn.
-        # Players 4&5 share target x=22 (bottom sideline) — same fix.
-        1:  (27.5, 20.0, -90), 2:  (22.0, 22.0, -90), 3:  (22.0, 20.0, -90),
-        4:  (22.0,-20.0,  90), 5:  (22.0,-22.0,  90), 6:  (15.0, 20.0, -90),
-        7:  ( 4.0, 20.0, -90), 8:  (11.0, 20.0, -90), 9:  (11.0,-20.0,  90),
-        10: ( 4.0,-20.0,  90), 11: ( 7.0, 20.0, -90),
-    }
-
-    ROBOT_MOTORS: ClassVar[Mapping[str, tuple[str, ...]]] = {
-        'ant': ('l4e1','l4e2','l1e1','l1e2','l2e1','l2e2','l3e1','l3e2'),
+    ROBOT_MOTORS = {
         'T1':  ('he1','he2','lae1','lae2','lae3','lae4','rae1','rae2','rae3','rae4',
                 'te1','lle1','lle2','lle3','lle4','lle5','lle6',
                 'rle1','rle2','rle3','rle4','rle5','rle6'),
@@ -115,14 +99,15 @@ class Client:
     HEAD_YAW_IDX   = 0
     HEAD_PITCH_IDX = 1
 
-    def __init__(self, host, port, team, player_no, model_name=None, default_role='attacker',
-                 ready_file=None):
+    best_ball_distance = 1000
+
+    def __init__(self, host, port, team, player_no, model_name=None, start_position=(2.0,  0.0, 0), default_role="attacker"):
         self._host       = host
         self._port       = port
-        self._model_name = 'ant' if model_name is None else model_name
+        self._model_name = 'T1'
         self._team       = team
         self._player_no  = player_no
-        self._ready_file = ready_file   # path to write player no when formation reached
+        self.BEAM_POSES["1"] = start_position
 
         self._policy_checkpoint = "locomotion_nn.pth"
         self._policy_meta       = "locomotion_nn_meta.json"
@@ -133,7 +118,7 @@ class Client:
         self._rcv_buffer      = bytearray(self._rcv_buffer_size)
         self._sock            = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._has_beamed      = False
-
+        
         # head tracking
         self._head_yaw_target   = 0.0
         self._head_pitch_target = 0.0
@@ -182,24 +167,54 @@ class Client:
         self._csv_header_done   = False
         self._aligned_with_goal = False  # True once robot-ball-goal are collinear; stays True
 
+        self.start = time.time()
+        self.elapsed_time = 0
+
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def run(self):
         logger.info('Connecting to %s:%d...', self._host, self._port)
-        try:
-            self._sock.connect((self._host, self._port))
-        except ConnectionRefusedError:
-            logger.error('Connection refused.')
+
+        connected = False
+        delay = 1.0
+        max_retries = 10
+        max_delay = 32
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Sockets usually cannot be reused after a failed connect attempt
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.connect((self._host, self._port))
+                connected = True
+                break
+            except (ConnectionRefusedError, OSError) as e:
+                if attempt == max_retries:
+                    logger.error('Connection failed after %d attempts: %s', max_retries, e)
+                    return
+                
+                # Exponential backoff with jitter
+                jitter = random.uniform(0, 0.5 * delay)
+                sleep_time = min(delay + jitter, max_delay)
+                
+                logger.warning('Connection failed (attempt %d/%d). Retrying in %.2f seconds...', attempt, max_retries, sleep_time)
+                time.sleep(sleep_time)
+                
+                delay *= 2  # Double the base delay for the next attempt
+
+        if not connected:
             return
+
         client_thread = threading.Thread(target=self._action_loop)
         client_thread.start()
         client_thread.join()
-        if self._csv_file:
-            self._csv_file.close()
+
         self._sock.close()
+        self.elapsed_time = time.time() - self.start
+        print("YEAH shutdown")
 
     def shutdown(self):
         self._sock.shutdown(socket.SHUT_RDWR)
+        
 
     # ------------------------------------------------------------------ policy
     def _init_policy_runtime_state(self):
@@ -476,61 +491,6 @@ class Client:
             return np.array([0.0, 0.0, self._search_dir * SEARCH_YAW_SPEED], dtype=np.float32)
         return np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-    # ------------------------------------------------------------------ CSV
-    def _open_csv(self):
-        if not ENABLE_CSV_LOGGING: return
-        os.makedirs(CSV_DIR, exist_ok=True)
-        ts   = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        path = os.path.join(CSV_DIR, f'robot_log_{self._team}_p{self._player_no}_{ts}.csv')
-        self._csv_file   = open(path, 'w', newline='')
-        self._csv_writer = csv.writer(self._csv_file)
-        self._csv_writer.writerow([
-            'game_time','play_mode','player_no','team','team_side',
-            'robot_world_x','robot_world_y','robot_world_z',
-            'role','ball_visible',
-            'ball_rel_x','ball_rel_y','ball_rel_z',
-            'ball_world_x','ball_world_y','ball_world_z',
-            'goal_rel_x','goal_rel_y',
-            'nearest_teammate_id','nearest_teammate_world_x',
-            'nearest_teammate_world_y','nearest_teammate_dist_to_ball',
-            'event',
-        ])
-        self._csv_header_done = True
-        logger.info('Logging to %s', path)
-
-    def _log_csv(self, game_time, play_mode, rwp, ball_visible,
-                 ball_x, ball_y, ball_z, goal_x, goal_y, event=''):
-        if not ENABLE_CSV_LOGGING or not self._csv_writer: return
-        # Events (game_init, kickoff) are always written; normal rows obey the N-cycle gate
-        if event == '' and self._cycle % CSV_EVERY_N_CYCLES != 0: return
-        bwp = self._ball_world_pos
-        nid = nwx = nwy = ndtb = ''
-        if self._teammate_world_pos and bwp is not None:
-            bxy = bwp[:2]
-            best = min(self._teammate_world_pos,
-                       key=lambda pid: np.linalg.norm(bxy - self._teammate_world_pos[pid][:2]))
-            tw = self._teammate_world_pos[best]
-            nid = best; nwx = round(float(tw[0]),3); nwy = round(float(tw[1]),3)
-            ndtb = round(float(np.linalg.norm(bxy - tw[:2])),3)
-        self._csv_writer.writerow([
-            round(game_time,3), play_mode, self._player_no, self._team,
-            self._team_side or '',
-            round(float(rwp[0]),3) if rwp is not None else '',
-            round(float(rwp[1]),3) if rwp is not None else '',
-            round(float(rwp[2]),3) if rwp is not None else '',
-            self._role, 1 if ball_visible else 0,
-            round(ball_x,3) if ball_x is not None else '',
-            round(ball_y,3) if ball_y is not None else '',
-            round(ball_z,3) if ball_z is not None else '',
-            round(float(bwp[0]),3) if bwp is not None else '',
-            round(float(bwp[1]),3) if bwp is not None else '',
-            round(float(bwp[2]),3) if bwp is not None else '',
-            round(goal_x,3) if goal_x is not None else '',
-            round(goal_y,3) if goal_y is not None else '',
-            nid, nwx, nwy, ndtb,
-            event,
-        ])
-
     # ------------------------------------------------------------------ main loop
     def _action_loop(self):
         self.nr_joints = len(self.ROBOT_MOTORS[self._model_name])
@@ -544,13 +504,12 @@ class Client:
         self.policy, self.policy_meta = load_policy_from_files(
             self._policy_checkpoint, self._policy_meta, self.device)
         self._init_policy_runtime_state()
-        self._open_csv()
 
-        logger.info('Initializing agent...')
+        #logger.info('Initializing agent...')
         init_msg = f'(init {self._model_name} {self._team} {self._player_no})'
         self._send_message(init_msg.encode())
 
-        logger.info('Running perception-action-loop.')
+        #logger.info('Running perception-action-loop.')
         while True:
             try:
                 perception_msg = self._receive_message()
@@ -560,17 +519,17 @@ class Client:
                     # Robot then walks from sideline to its BEAM_POSES formation position.
                     self._has_beamed = True
                     self._init_policy_runtime_state()
-                    sx, sy, sa = self.SIDELINE_POSES[self._player_no]
+                    sx, sy, sa = self.BEAM_POSES[self._player_no]
                     # Init dead-reckoning from known beam position
                     self._dr_pos = np.array([sx, sy], dtype=np.float32)
                     _sa_rad = np.deg2rad(sa)
                     self._dr_walk_dir = np.array(
                         [np.cos(_sa_rad), np.sin(_sa_rad)], dtype=np.float32)
                     _btx, _bty, _ = self.BEAM_POSES[self._player_no]
-                    logger.info('[P%d] DR init: start=(%.1f,%.1f) dir=(%.2f,%.2f) target=(%.1f,%.1f)',
-                                self._player_no, sx, sy,
-                                float(self._dr_walk_dir[0]), float(self._dr_walk_dir[1]),
-                                _btx, _bty)
+                    #logger.info('[P%d] DR init: start=(%.1f,%.1f) dir=(%.2f,%.2f) target=(%.1f,%.1f)',
+                    #            self._player_no, sx, sy,
+                    #            float(self._dr_walk_dir[0]), float(self._dr_walk_dir[1]),
+                    #            _btx, _bty)
                     self._send_message(f'(beam {sx:.1f} {sy:.1f} {sa:.1f})'.encode())
                     continue
 
@@ -605,7 +564,7 @@ class Client:
                 if self._spawn_yaw is None:
                     _sfwd = rot.apply(np.array([1.0, 0.0, 0.0], dtype=np.float32))
                     self._spawn_yaw = float(np.arctan2(float(_sfwd[1]), float(_sfwd[0])))
-                    logger.info('[P%d] spawn_yaw recorded: %.1f°', self._player_no, np.rad2deg(self._spawn_yaw))
+                    #logger.info('[P%d] spawn_yaw recorded: %.1f°', self._player_no, np.rad2deg(self._spawn_yaw))
 
                 # robot world pos — update if server sends it; otherwise keep last known
                 tm = re.search(
@@ -653,7 +612,13 @@ class Client:
                 else:
                     ball_dist = ball_x = ball_y = ball_z = None
                     self._cycles_since_ball += 1
-
+                if ball_dist:
+                    if ball_dist < self.best_ball_distance:
+                        self.best_ball_distance = ball_dist
+                    
+                    print("ball_dist ", ball_dist)
+                    if self.best_ball_distance < 0.9:
+                        break
                 # goal
                 goal_x, goal_y = self._parse_goal(perception_msg_str, cur_head_yaw)
                 # Head-frame azimuth — only valid when goal directly visible
@@ -709,7 +674,7 @@ class Client:
                 if ball_x is not None and self._smooth_ball_x is not None:
                     if (float(np.sqrt(ball_x**2+ball_y**2)) > BALL_RESET_NEW_DIST_M and
                             float(np.sqrt(self._smooth_ball_x**2+self._smooth_ball_y**2)) < BALL_RESET_OLD_DIST_M):
-                        logger.info('[P%d] Ball reset detected — clearing state', self._player_no)
+                        #logger.info('[P%d] Ball reset detected — clearing state', self._player_no)
                         self._smooth_ball_x = self._smooth_ball_y = None
                         self._ball_world_pos = None
                         self._last_ball_x = self._last_ball_y = self._last_ball_z = None
@@ -734,8 +699,8 @@ class Client:
                         and play_mode != 'BeforeKickOff'):
                     self._formation_phase   = False
                     self._post_kickoff_wait = KICKOFF_STAND_CYCLES   # hold 3 s before chasing
-                    logger.info('[P%d] Kickoff! Holding position for %d cycles then chasing ball.',
-                                self._player_no, KICKOFF_STAND_CYCLES)
+                    #logger.info('[P%d] Kickoff! Holding position for %d cycles then chasing ball.',
+                    #            self._player_no, KICKOFF_STAND_CYCLES)
 
                 # CSV event rows: game_init (first BeforeKickOff) and kickoff transition
                 if ENABLE_CSV_LOGGING and self._csv_writer and self._csv_header_done:
@@ -745,14 +710,14 @@ class Client:
                         self._log_csv(game_time, play_mode, rwp, ball_visible,
                                       ball_x, ball_y, ball_z, goal_x, goal_y,
                                       event='game_init')
-                        logger.info('[P%d] CSV: game_init logged (BeforeKickOff)', self._player_no)
+                        #logger.info('[P%d] CSV: game_init logged (BeforeKickOff)', self._player_no)
                     elif (self._prev_play_mode == 'BeforeKickOff'
                           and play_mode != 'BeforeKickOff'):
                         # Log the kickoff transition row
                         self._log_csv(game_time, play_mode, rwp, ball_visible,
                                       ball_x, ball_y, ball_z, goal_x, goal_y,
                                       event='kickoff_start')
-                        logger.info('[P%d] CSV: kickoff_start logged (→ %s)', self._player_no, play_mode)
+                        #logger.info('[P%d] CSV: kickoff_start logged (→ %s)', self._player_no, play_mode)
 
                 # periodic logging
                 if self._log_cycle % 25 == 0:
@@ -792,9 +757,6 @@ class Client:
                         logger.info('  teammate P%d  world=(%.1f,%.1f)  dist_ball=%s  age=%dcyc',
                                     pid, tw[0], tw[1], dtb, age)
 
-                # goal velocity — debug: log perception once so we can see torso_pos format
-                if self._cycle == 2:
-                    logger.info('[P%d] PERCEPTION SAMPLE (full): %s', self._player_no, perception_msg_str[:1500])
 
                 self.wait_until_walking = max(0, self.wait_until_walking - 1)
 
@@ -813,18 +775,6 @@ class Client:
                             self._dr_pos = (
                                 self._dr_pos
                                 + self._dr_walk_dir * _step)
-                    if self._log_cycle % 25 == 0:
-                        logger.info('[P%d] DR pos=(%.1f,%.1f) dist_to_target=%.1f',
-                                    self._player_no,
-                                    float(self._dr_pos[0]), float(self._dr_pos[1]),
-                                    _dr_to_target)
-
-                # diagnostic: log state every 25 cycles during formation
-                if self._formation_phase and self._log_cycle % 25 == 0:
-                    logger.info('[P%d] formation_phase  pm=%s  rwp=%s  wait=%d',
-                                self._player_no, play_mode,
-                                f'({rwp[0]:.1f},{rwp[1]:.1f})' if rwp is not None else 'None',
-                                self.wait_until_walking)
 
                 if self._formation_phase:
                     if self.wait_until_walking > 0:
@@ -844,13 +794,7 @@ class Client:
                                 self._post_kickoff_wait = KICKOFF_STAND_CYCLES  # 3 s hold
                                 logger.info('[P%d] Formation position reached — holding for %d cycles',
                                             self._player_no, KICKOFF_STAND_CYCLES)
-                                if self._ready_file:
-                                    try:
-                                        with open(self._ready_file, 'a') as _rf:
-                                            _rf.write(f'{self._player_no}\n')
-                                    except OSError as _e:
-                                        logger.warning('[P%d] Could not write ready file: %s',
-                                                       self._player_no, _e)
+
                             # Count down — then release to chase ball
                             _yaw_to_ball = float(np.clip(cur_head_yaw * STEER_KP, -1.0, 1.0))
                             goal_vel = np.array([0.0, 0.0, _yaw_to_ball], dtype=np.float32)
@@ -1019,10 +963,12 @@ class Client:
                 self.policy_hidden   = next_policy_hidden
                 self._step_gait_manager()
 
-                self._log_csv(game_time, play_mode, rwp, ball_visible,
-                              ball_x, ball_y, ball_z, goal_x, goal_y)
+                #self._log_csv(game_time, play_mode, rwp, ball_visible,
+                #              ball_x, ball_y, ball_z, goal_x, goal_y)
                 action_msg = ''.join(msg_list)
                 self._send_message(action_msg.encode())
+
+            # TODO implement ball distance calculation here
 
             except Exception as e:
                 logger.info('Server connection closed or client crashed.')
@@ -1069,6 +1015,9 @@ class Client:
         return result
 
 
+def _shutdown(sig: int, frame: FrameType | None) -> None:
+    client.shutdown()
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='The RoboCup MuJoCo Soccer Simulation Booster Client.')
     robots = list(Client.ROBOT_MOTORS.keys())
@@ -1077,8 +1026,6 @@ if __name__ == '__main__':
     parser.add_argument('-t', '--team',      type=str, help='The team name.',      default='Test',      required=False)
     parser.add_argument('-n', '--player_no', type=int, help='The player number.',  default=1,           required=False)
     parser.add_argument('-r', '--robot',      type=str, help='The robot model.',    default=robots[0],   required=False, choices=robots)
-    parser.add_argument('--ready-file',       type=str, help='Path to formation-ready status file shared with trainer.py.',
-                        default='formation_ready.txt', required=False)
 
     args = parser.parse_args()
 
@@ -1091,8 +1038,8 @@ if __name__ == '__main__':
         team=args.team,
         player_no=args.player_no,
         model_name=args.robot,
-        ready_file=args.ready_file,
     )
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
     client.run()
+    print(client.elapsed_time)
