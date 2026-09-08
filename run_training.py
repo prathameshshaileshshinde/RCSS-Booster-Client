@@ -92,6 +92,8 @@ for episode in range(num_episodes):
     )
     client.run()
     #print(client.elapsed_time) # TODO write this into a file
+    with open("training_log.txt", "a") as f:
+        f.write(f"Run {i+1:>3} | elapsed_time: {client.elapsed_time:.4f}s\n")
     if client.elapsed_time > 0.0:
         reward = 60.0 - client.elapsed_time
         print(f"--> Success! Reached ball in {client.elapsed_time:.2f}s | Reward: {reward:.2f}")
