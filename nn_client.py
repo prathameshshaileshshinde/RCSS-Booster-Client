@@ -81,15 +81,11 @@ CSV_DIR            = "CSV"
 ch = logging.StreamHandler()
 ch.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
 ch.setLevel(logging.INFO)
-logging.basicConfig(handlers=[ch], level=logging.DEBUG)
+logging.basicConfig(handlers=[ch], level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class Client:
-    BEAM_POSES = {
-        1:  (2.0,  0.0, 0)
-    }
-
     ROBOT_MOTORS = {
         'T1':  ('he1','he2','lae1','lae2','lae3','lae4','rae1','rae2','rae3','rae4',
                 'te1','lle1','lle2','lle3','lle4','lle5','lle6',
@@ -101,13 +97,13 @@ class Client:
 
     best_ball_distance = 1000
 
-    def __init__(self, host, port, team, player_no, model_name=None, start_position=(2.0,  0.0, 0), default_role="attacker"):
+    def __init__(self, host, port, team, player_no, model_name, start_position, default_role="attacker"):
         self._host       = host
         self._port       = port
         self._model_name = 'T1'
         self._team       = team
         self._player_no  = player_no
-        self.BEAM_POSES["1"] = start_position
+        self.start_position = start_position
 
         self._policy_checkpoint = "locomotion_nn.pth"
         self._policy_meta       = "locomotion_nn_meta.json"
@@ -173,7 +169,7 @@ class Client:
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def run(self):
-        logger.info('Connecting to %s:%d...', self._host, self._port)
+        #logger.info('Connecting to %s:%d...', self._host, self._port)
 
         connected = False
         delay = 1.0
@@ -210,7 +206,10 @@ class Client:
 
         self._sock.close()
         self.elapsed_time = time.time() - self.start
-        print("YEAH shutdown")
+        # return negative number if not reached in time
+        if self.elapsed_time > 60:
+            self.elapsed_time = -10
+        #print("YEAH shutdown")
 
     def shutdown(self):
         self._sock.shutdown(socket.SHUT_RDWR)
@@ -437,7 +436,7 @@ class Client:
         Uses the same BEAM_POSES XY coordinates as a walking target instead of
         teleporting.  Returns [0,0,0] once within FORMATION_ARRIVE_DIST metres.
         """
-        target_x, target_y, _ = self.BEAM_POSES[self._player_no]
+        target_x, target_y, _ = self.start_position
         target_xy  = np.array([target_x, target_y], dtype=np.float32)
         robot_xy   = robot_world_pos[:2]
         offset     = target_xy - robot_xy
@@ -455,10 +454,6 @@ class Client:
         yaw_vel  = float(np.clip(body_ang * STEER_KP, -1.0, 1.0))
         # Slow down as we get close; cap at full forward speed
         speed    = float(np.clip(dist * 0.5, 0.2, FOLLOW_FORWARD_SPEED))
-
-        if self._log_cycle % 25 == 0:
-            logger.info('[P%d] → formation (%.1f, %.1f)  dist=%.2fm  yaw_err=%.1f°',
-                        self._player_no, target_x, target_y, dist, np.rad2deg(body_ang))
 
         return np.array([speed, 0.0, yaw_vel], dtype=np.float32)
 
@@ -505,11 +500,11 @@ class Client:
             self._policy_checkpoint, self._policy_meta, self.device)
         self._init_policy_runtime_state()
 
-        #logger.info('Initializing agent...')
+        logger.info('Initializing agent...')
         init_msg = f'(init {self._model_name} {self._team} {self._player_no})'
         self._send_message(init_msg.encode())
 
-        #logger.info('Running perception-action-loop.')
+        logger.info('Running perception-action-loop.')
         while True:
             try:
                 perception_msg = self._receive_message()
@@ -519,13 +514,14 @@ class Client:
                     # Robot then walks from sideline to its BEAM_POSES formation position.
                     self._has_beamed = True
                     self._init_policy_runtime_state()
-                    sx, sy, sa = self.BEAM_POSES[self._player_no]
+                    sx, sy, sa = self.start_position
+                    print("______",sx, sy, sa)
                     # Init dead-reckoning from known beam position
                     self._dr_pos = np.array([sx, sy], dtype=np.float32)
                     _sa_rad = np.deg2rad(sa)
                     self._dr_walk_dir = np.array(
                         [np.cos(_sa_rad), np.sin(_sa_rad)], dtype=np.float32)
-                    _btx, _bty, _ = self.BEAM_POSES[self._player_no]
+                    _btx, _bty, _ = self.start_position
                     #logger.info('[P%d] DR init: start=(%.1f,%.1f) dir=(%.2f,%.2f) target=(%.1f,%.1f)',
                     #            self._player_no, sx, sy,
                     #            float(self._dr_walk_dir[0]), float(self._dr_walk_dir[1]),
@@ -612,13 +608,17 @@ class Client:
                 else:
                     ball_dist = ball_x = ball_y = ball_z = None
                     self._cycles_since_ball += 1
+
                 if ball_dist:
                     if ball_dist < self.best_ball_distance:
                         self.best_ball_distance = ball_dist
                     
-                    print("ball_dist ", ball_dist)
+                    #print("ball_dist ", ball_dist)
                     if self.best_ball_distance < 0.9:
                         break
+                
+                if time.time() - self.start > 60:
+                    break
                 # goal
                 goal_x, goal_y = self._parse_goal(perception_msg_str, cur_head_yaw)
                 # Head-frame azimuth — only valid when goal directly visible
@@ -723,12 +723,7 @@ class Client:
                 if self._log_cycle % 25 == 0:
                     src = ('vision' if ball_visible else
                            'world_model' if self._ball_world_pos is not None else 'last_known')
-                    if ball_x is not None:
-                        logger.info('[P%d] role=%-9s  Ball x=%.2f y=%.2f dist=%.2f  [%s]',
-                                    self._player_no, self._role.upper(),
-                                    ball_x, ball_y, ball_dist or 0.0, src)
-                    else:
-                        logger.info('[P%d] role=%-9s  Ball NOT visible', self._player_no, self._role.upper())
+
                     # Alignment diagnostics: show which check path is available
                     if ball_raw is not None and ball_raw[0] <= ORBIT_ENGAGE_M:
                         if self._ball_world_pos is not None and self._goal_world_pos is not None:
@@ -736,26 +731,12 @@ class Client:
                             exp = float(np.arctan2(btg[1], btg[0]))
                             fwd = rot.apply(np.array([1.0, 0.0, 0.0], dtype=np.float32))
                             yaw = float(np.arctan2(fwd[1], fwd[0]))
-                            logger.info('[P%d] align PRIMARY  robot_yaw=%.1f°  expected=%.1f°  diff=%.1f°',
-                                        self._player_no, np.rad2deg(yaw), np.rad2deg(exp),
-                                        np.rad2deg(abs(float(self._wrap_to_pi(yaw - exp)))))
-                        elif goal_cam_az is not None:
-                            logger.info('[P%d] align FALLBACK-A  ball_az=%.1f°  goal_cam_az=%.1f°  diff=%.1f°',
-                                        self._player_no, np.rad2deg(ball_raw[1]), np.rad2deg(goal_cam_az),
-                                        np.rad2deg(abs(float(self._wrap_to_pi(ball_raw[1] - goal_cam_az)))))
-                        else:
-                            logger.info('[P%d] align NO-DATA  ball_world=%s  goal_world=%s  goal_cam_az=%s  goal_x=%s',
-                                        self._player_no,
-                                        'ok' if self._ball_world_pos is not None else 'NONE',
-                                        'ok' if self._goal_world_pos is not None else 'NONE',
-                                        f'{np.rad2deg(goal_cam_az):.1f}°' if goal_cam_az is not None else 'NONE',
-                                        f'{goal_x:.2f}' if goal_x is not None else 'NONE')
+
+
                     for pid, tw in self._teammate_world_pos.items():
                         age = self._cycle - self._teammate_last_seen.get(pid, self._cycle)
                         bxy = self._ball_world_pos[:2] if self._ball_world_pos is not None else None
                         dtb = f'{np.linalg.norm(bxy-tw[:2]):.1f}m' if bxy is not None else '?'
-                        logger.info('  teammate P%d  world=(%.1f,%.1f)  dist_ball=%s  age=%dcyc',
-                                    pid, tw[0], tw[1], dtb, age)
 
 
                 self.wait_until_walking = max(0, self.wait_until_walking - 1)
@@ -763,7 +744,7 @@ class Client:
                 # Update dead-reckoning position during formation walk
                 if (self._formation_phase and self.wait_until_walking == 0
                         and self._dr_pos is not None and self._dr_walk_dir is not None):
-                    _btx2, _bty2, _ = self.BEAM_POSES[self._player_no]
+                    _btx2, _bty2, _ = self.start_position
                     _dr_to_target = float(np.linalg.norm(
                         self._dr_pos - np.array([_btx2, _bty2], dtype=np.float32)))
                     if _dr_to_target > 0.0:
@@ -784,7 +765,7 @@ class Client:
                     else:
                         goal_vel = np.array([FOLLOW_FORWARD_SPEED, 0.0, 0.0], dtype=np.float32)
                     if self.wait_until_walking == 0 and rwp is not None:
-                        _tx, _ty, _ = self.BEAM_POSES[self._player_no]
+                        _tx, _ty, _ = self.start_position
                         _dist_form = float(np.linalg.norm(
                             rwp[:2] - np.array([_tx, _ty], dtype=np.float32)))
                         if _dist_form < FORMATION_ARRIVE_DIST:
@@ -792,8 +773,7 @@ class Client:
                             if not self._formation_arrived:
                                 self._formation_arrived = True
                                 self._post_kickoff_wait = KICKOFF_STAND_CYCLES  # 3 s hold
-                                logger.info('[P%d] Formation position reached — holding for %d cycles',
-                                            self._player_no, KICKOFF_STAND_CYCLES)
+
 
                             # Count down — then release to chase ball
                             _yaw_to_ball = float(np.clip(cur_head_yaw * STEER_KP, -1.0, 1.0))
@@ -802,7 +782,6 @@ class Client:
                                 self._post_kickoff_wait -= 1
                                 if self._post_kickoff_wait == 0:
                                     self._formation_phase = False
-                                    logger.info('[P%d] Hold done — chasing ball!', self._player_no)
                         else:
                             self._at_formation_cycles = 0
                             goal_vel = self._walk_to_formation(rwp, orientation_quat_inv)
@@ -812,8 +791,6 @@ class Client:
                     self._post_kickoff_wait -= 1
                     _yaw_to_ball = float(np.clip(cur_head_yaw * STEER_KP, -1.0, 1.0))
                     goal_vel = np.array([0.0, 0.0, _yaw_to_ball], dtype=np.float32)
-                    if self._post_kickoff_wait == 0:
-                        logger.info('[P%d] Post-kickoff hold done — chasing ball!', self._player_no)
 
                 elif self._aligned_with_goal:
                     # Aligned: walk forward to push ball into goal.
@@ -837,7 +814,6 @@ class Client:
                     if _err is not None and abs(_err) > 3 * ALIGN_THRESHOLD_RAD:
                         self._aligned_with_goal = False
                         self._orbiting = False
-                        logger.info('[P%d] Re-orbiting (drift %.1f°)', self._player_no, np.rad2deg(abs(_err)))
 
                 else:
                     # Supporter: use standard decision.
@@ -921,13 +897,10 @@ class Client:
                                 _yaw_err  = abs(float(self._wrap_to_pi(_curr_yaw - _goal_target_yaw)))
                                 _ball_ahead = abs(cur_head_yaw) < np.deg2rad(15)
                                 _aligned = (_yaw_err < ALIGN_THRESHOLD_RAD and _ball_ahead)
-                                logger.info('[P%d] align-C  curr=%.1f°  target=%.1f°  err=%.1f°  head=%.1f°  vy=%.2f  ok=%s',
-                                            self._player_no, np.rad2deg(_curr_yaw), np.rad2deg(_goal_target_yaw),
-                                            np.rad2deg(_yaw_err), np.rad2deg(cur_head_yaw), _vy, _aligned)
+
                             if _aligned:
                                 self._aligned_with_goal = True
                                 self._orbiting = False
-                                logger.info('[P%d] Aligned with goal — stopping', self._player_no)
                                 goal_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
                 # head
@@ -1042,4 +1015,4 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
     client.run()
-    print(client.elapsed_time)
+    #print(client.elapsed_time)
